@@ -30,8 +30,10 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 CONFIG_FILE = Path.home() / ".sharp_toner_monitor.json"
-LOW_THRESHOLD = 10          # percent remaining at/below which a toner counts as low
-WASTE_FULL_THRESHOLD = 190   # waste collector: counts as full at or above this % full
+LOW_THRESHOLD = 10          # toner counts as low at/below this % remaining
+WASTE_FULL_THRESHOLD = 190   # waste collector counts as full at/above this % full
+DEFAULT_MIN_STOCK = 1       # minimum spares to keep for any part without its own
+                            # minimum (set per part on the Inventory tab)
 AUTO_REFRESH_MS = 5 * 60 * 1000
 SNMP_TIMEOUT = 2.0
 SNMP_RETRIES = 1
@@ -259,12 +261,14 @@ def fetch_copier(ip, community):
 # Inventory logic (pure functions, no GUI)
 # --------------------------------------------------------------------------
 
-def inventory_rows(copiers, results, stock):
+def inventory_rows(copiers, results, stock, minimums=None):
     """
     Combine copier part assignments, latest readings, and stock on hand.
     Every machine whose toner/waste collector is currently low counts as one
-    unit needed from stock. Returns a list of dicts, one per part number.
+    unit needed from stock. The result is compared with each part's minimum
+    (from `minimums`, else DEFAULT_MIN_STOCK). Returns one dict per part number.
     """
+    minimums = minimums or {}
     machines, low, types, low_by = Counter(), Counter(), {}, {}
     for c in copiers:
         res = results.get(c["ip"])
@@ -281,12 +285,15 @@ def inventory_rows(copiers, results, stock):
                 low_by.setdefault(part, []).append(f"{c['name']} ({header})")
 
     rows = []
-    for part in sorted(set(stock) | set(machines)):
+    for part in sorted(set(stock) | set(machines) | set(minimums)):
         on_hand = stock.get(part, 0)
         need = low[part]
         net = on_hand - need
+        minimum = minimums.get(part, DEFAULT_MIN_STOCK)
         if net < 0:
-            status, tag = f"ORDER {-net}", "short"
+            status, tag = f"ORDER {minimum - net}", "short"
+        elif net < minimum:
+            status, tag = f"Reorder {minimum - net}", "warn"
         elif on_hand == 0 and machines[part]:
             status, tag = "Out of stock", "warn"
         elif net == 0 and need:
@@ -295,7 +302,7 @@ def inventory_rows(copiers, results, stock):
             status, tag = "OK", ""
         rows.append({"part": part, "type": ", ".join(types.get(part, [])) or "(unassigned)",
                      "machines": machines[part], "low": need, "on_hand": on_hand,
-                     "net": net, "status": status, "tag": tag,
+                     "net": net, "minimum": minimum, "status": status, "tag": tag,
                      "low_machines": low_by.get(part, [])})
     return rows
 
@@ -373,7 +380,7 @@ class App(tk.Tk):
         self.geometry("1150x520")
         self.minsize(900, 360)
 
-        self.copiers, self.stock = self._load()
+        self.copiers, self.stock, self.minimums = self._load()
         self.results = {}       # ip -> last good reading
         self.errors = {}        # ip -> last error message (cleared on success)
         self.q = queue.Queue()
@@ -405,18 +412,20 @@ class App(tk.Tk):
         try:
             data = json.loads(CONFIG_FILE.read_text())
         except Exception:
-            return [], {}
+            return [], {}, {}
         if isinstance(data, list):                  # older file format
             data = {"copiers": data, "stock": {}}
         copiers = data.get("copiers", [])
         for c in copiers:
             c.setdefault("parts", {})
         stock = {norm_part(k): int(v) for k, v in data.get("stock", {}).items()}
-        return copiers, stock
+        minimums = {norm_part(k): int(v) for k, v in data.get("minimums", {}).items()}
+        return copiers, stock, minimums
 
     def _save(self):
         try:
-            CONFIG_FILE.write_text(json.dumps({"copiers": self.copiers, "stock": self.stock}, indent=2))
+            CONFIG_FILE.write_text(json.dumps({"copiers": self.copiers, "stock": self.stock,
+                                                "minimums": self.minimums}, indent=2))
         except OSError as e:
             messagebox.showwarning("Save failed", str(e))
 
@@ -615,12 +624,13 @@ class App(tk.Tk):
     INV_COLUMNS = (("part", "Part number", 140), ("type", "Type", 230),
                    ("machines", "Machines using", 100), ("low", "Low now", 70),
                    ("on_hand", "On hand", 70), ("net", "After replacing", 100),
-                   ("status", "Status", 140))
+                   ("minimum", "Minimum", 80), ("status", "Status", 160))
 
     def _build_inventory_tab(self, tab):
         form = ttk.LabelFrame(tab, text="Adjust stock", padding=8)
         form.pack(fill="x", padx=4, pady=(6, 4))
         self.part_var, self.qty_var = tk.StringVar(), tk.StringVar(value="1")
+        self.min_var = tk.StringVar(value=str(DEFAULT_MIN_STOCK))
 
         ttk.Label(form, text="Part number").grid(row=0, column=0, sticky="w")
         self.part_combo = ttk.Combobox(form, textvariable=self.part_var, width=22)
@@ -629,7 +639,10 @@ class App(tk.Tk):
         ttk.Spinbox(form, from_=1, to=999, textvariable=self.qty_var, width=6).grid(row=1, column=1, padx=(0, 8))
         ttk.Button(form, text="+ Add to stock", command=lambda: self.adjust_stock(+1)).grid(row=1, column=2, padx=2)
         ttk.Button(form, text="\u2212 Remove from stock", command=lambda: self.adjust_stock(-1)).grid(row=1, column=3, padx=2)
-        ttk.Button(form, text="Delete part", command=self.delete_part).grid(row=1, column=4, padx=(16, 0))
+        ttk.Label(form, text="Minimum to keep").grid(row=0, column=5, sticky="w", padx=(16, 0))
+        ttk.Spinbox(form, from_=0, to=999, textvariable=self.min_var, width=6).grid(row=1, column=5, padx=(16, 8))
+        ttk.Button(form, text="Set minimum", command=self.set_minimum).grid(row=1, column=6, padx=2)
+        ttk.Button(form, text="Delete part", command=self.delete_part).grid(row=1, column=7, padx=(16, 0))
 
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
@@ -652,7 +665,7 @@ class App(tk.Tk):
                   wraplength=1000, justify="left").pack(fill="x", padx=6, pady=(0, 4))
 
     def current_inventory_rows(self):
-        return inventory_rows(self.copiers, self.results, self.stock)
+        return inventory_rows(self.copiers, self.results, self.stock, self.minimums)
 
     def refresh_inventory(self):
         rows = self.current_inventory_rows()
@@ -663,14 +676,15 @@ class App(tk.Tk):
             self._inv_low_machines[r["part"]] = r["low_machines"]
             self.inv_tree.insert("", "end", iid=r["part"], tags=(r["tag"],) if r["tag"] else (),
                                  values=(r["part"], r["type"], r["machines"], r["low"],
-                                         r["on_hand"], r["net"], r["status"]))
+                                         r["on_hand"], r["net"], r["minimum"], r["status"]))
         if selected and self.inv_tree.exists(selected[0]):
             self.inv_tree.selection_set(selected[0])
         self.part_combo["values"] = [r["part"] for r in rows]
 
         unassigned = sum(1 for c in self.copiers if not any((c.get("parts") or {}).values()))
         unread = sum(1 for c in self.copiers if c["ip"] not in self.results)
-        notes = ["'After replacing' = on hand minus machines currently low. "
+        notes = ["'After replacing' = on hand minus machines currently low; "
+                 "Status compares it with the part's minimum. "
                  "Refresh copiers before deducting a toner you just installed, "
                  "or it will be counted twice until the machine reads full."]
         if unassigned:
@@ -683,6 +697,7 @@ class App(tk.Tk):
         sel = self.inv_tree.selection()
         if sel:
             self.part_var.set(sel[0])
+            self.min_var.set(str(self.minimums.get(sel[0], DEFAULT_MIN_STOCK)))
 
     def _inv_details(self, _event):
         sel = self.inv_tree.selection()
@@ -713,6 +728,24 @@ class App(tk.Tk):
         self.refresh_inventory()
         self.status.set(f"{part}: {'added' if sign > 0 else 'removed'} {qty}, now {self.stock[part]} on hand")
 
+    def set_minimum(self):
+        part = norm_part(self.part_var.get())
+        if not part:
+            messagebox.showerror("Part number", "Enter or select a part number.")
+            return
+        try:
+            minimum = int(self.min_var.get())
+            if minimum < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Minimum", "Minimum must be a whole number, 0 or more.")
+            return
+        self.minimums[part] = minimum
+        self.stock.setdefault(part, 0)
+        self._save()
+        self.refresh_inventory()
+        self.status.set(f"{part}: minimum set to {minimum}")
+
     def delete_part(self):
         part = norm_part(self.part_var.get())
         if not part:
@@ -729,6 +762,7 @@ class App(tk.Tk):
                 "Delete part", f"Delete {part}? {self.stock[part]} on hand will be forgotten."):
             return
         del self.stock[part]
+        self.minimums.pop(part, None)
         self.part_var.set("")
         self._save()
         self.refresh_inventory()
