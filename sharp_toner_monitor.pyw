@@ -27,12 +27,12 @@ import tkinter as tk
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_FILE = Path.home() / ".sharp_toner_monitor.json"
 LOW_THRESHOLD = 10          # toner counts as low at/below this % remaining
-WASTE_FULL_THRESHOLD = 190   # waste collector counts as full at/above this % full
-DEFAULT_MIN_STOCK = 1       # minimum spares to keep for any part without its own
+WASTE_FULL_THRESHOLD = 90   # waste collector counts as full at/above this % full
+DEFAULT_MIN_STOCK = 0       # minimum spares to keep for any part without its own
                             # minimum (set per part on the Inventory tab)
 AUTO_REFRESH_MS = 5 * 60 * 1000
 SNMP_TIMEOUT = 2.0
@@ -49,6 +49,34 @@ def slot_type_label(slot, header):
 
 def norm_part(text):
     return (text or "").strip().upper()
+
+
+# Columns sorted as text; every other column is sorted numerically when it
+# starts with a number ("45%", "95% full", "-2"), with text after the numbers
+# and blank / "-" / "?" cells always last.
+TEXT_COLUMNS = {"name", "model", "parts", "part", "type", "status"}
+_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
+
+
+def _natural(text):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text)]
+
+
+def sort_key(col, text):
+    """Sort key for a table cell, or None for blank cells."""
+    text = str(text).strip()
+    if text in ("", "-", "?"):
+        return None
+    if col == "ip":
+        try:
+            return (0, int(ipaddress.ip_address(text)))
+        except ValueError:
+            pass
+    if col not in TEXT_COLUMNS:
+        m = _NUM.match(text)
+        if m:
+            return (0, float(m.group(1)))
+    return (1, _natural(text))
 
 
 # --------------------------------------------------------------------------
@@ -367,6 +395,44 @@ class PartsDialog(tk.Toplevel):
         self.destroy()
 
 
+class CopierDialog(tk.Toplevel):
+    """Edit a copier's name, IP address and SNMP community."""
+
+    def __init__(self, app, copier):
+        super().__init__(app)
+        self.title(f"Edit {copier['name']}")
+        self.transient(app)
+        self.resizable(False, False)
+        self.app, self.copier = app, copier
+        body = ttk.Frame(self, padding=12)
+        body.pack()
+        self.vars = {}
+        for r, (key, label) in enumerate((("ip", "IP address"), ("name", "Name"),
+                                          ("community", "SNMP community"))):
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=3, padx=(0, 10))
+            var = tk.StringVar(value=copier[key])
+            ttk.Entry(body, textvariable=var, width=28).grid(row=r, column=1)
+            self.vars[key] = var
+        ttk.Label(body, text="Assigned parts stay with the copier, even if you change its IP.",
+                  foreground="#666666").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        btns = ttk.Frame(body)
+        btns.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btns, text="Save", command=self._save).pack(side="right")
+        self.bind("<Return>", lambda e: self._save())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.grab_set()
+
+    def _save(self):
+        err = self.app.apply_copier_edit(self.copier, self.vars["ip"].get().strip(),
+                                         self.vars["name"].get().strip(),
+                                         self.vars["community"].get().strip())
+        if err:
+            messagebox.showerror("Edit copier", err, parent=self)
+            return
+        self.destroy()
+
+
 class App(tk.Tk):
     COLUMNS = (("name", "Copier", 140), ("ip", "IP Address", 105),
                ("model", "Model", 170), ("K", "Black", 65), ("C", "Cyan", 65),
@@ -387,6 +453,7 @@ class App(tk.Tk):
         self.pool = ThreadPoolExecutor(max_workers=8)
         self.auto_var = tk.BooleanVar(value=False)
         self._auto_job = None
+        self.sorts = {"copier": None, "inv": ("part", False)}   # name -> (column, descending)
 
         self.status = tk.StringVar(value="Ready")
         ttk.Label(self, textvariable=self.status, relief="sunken", anchor="w",
@@ -402,6 +469,7 @@ class App(tk.Tk):
 
         for c in self.copiers:
             self._insert_row(c)
+        self._resort_copiers()
         self.refresh_inventory()
         self.after(100, self._poll_queue)
         if self.copiers:
@@ -453,18 +521,19 @@ class App(tk.Tk):
         bar.pack(fill="x")
         ttk.Button(bar, text="Refresh all", command=self.refresh_all).pack(side="left")
         ttk.Button(bar, text="Assign parts...", command=self.assign_parts).pack(side="left", padx=6)
-        ttk.Button(bar, text="Remove selected", command=self.remove_selected).pack(side="left")
+        ttk.Button(bar, text="Edit copier...", command=self.edit_copier).pack(side="left")
+        ttk.Button(bar, text="Remove selected", command=self.remove_selected).pack(side="left", padx=6)
         ttk.Checkbutton(bar, text="Auto-refresh every 5 min", variable=self.auto_var,
                         command=self._toggle_auto).pack(side="left", padx=10)
-        ttk.Label(bar, text="Double-click a row for all supplies").pack(side="right")
+        ttk.Label(bar, text="Double-click a row for all supplies  |  click a header to sort").pack(side="right")
 
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.tree = ttk.Treeview(frame, columns=[c[0] for c in self.COLUMNS],
                                  show="headings", selectmode="browse")
         for key, title, width in self.COLUMNS:
-            self.tree.heading(key, text=title)
             self.tree.column(key, width=width, anchor="center" if key in self.CENTERED else "w")
+        self._make_sortable(self.tree, "copier", self.COLUMNS)
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
@@ -489,6 +558,7 @@ class App(tk.Tk):
         self.copiers.append(copier)
         self._save()
         self._insert_row(copier)
+        self._resort_copiers()
         self.ip_var.set("")
         self.name_var.set("")
         self._refresh_one(copier)
@@ -517,9 +587,77 @@ class App(tk.Tk):
         def saved():
             self._save()
             self._update_row(copier["ip"])
+            self._resort_copiers()
             self.refresh_inventory()
 
         PartsDialog(self, copier, saved)
+
+    def edit_copier(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Edit copier", "Select a copier first.")
+            return
+        CopierDialog(self, next(c for c in self.copiers if c["ip"] == sel[0]))
+
+    def apply_copier_edit(self, copier, ip, name, community):
+        """Apply edits from the dialog. Returns an error string, or None on success."""
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return f"'{ip}' is not a valid IP address."
+        if any(c is not copier and c["ip"] == ip for c in self.copiers):
+            return f"{ip} is already in the list."
+        old_ip = copier["ip"]
+        if name == old_ip and ip != old_ip:         # name was just the old IP
+            name = ip
+        copier["name"] = name or ip
+        copier["community"] = community or "public"
+        if ip != old_ip:
+            index = self.tree.index(old_ip)
+            self.tree.delete(old_ip)
+            self.results.pop(old_ip, None)          # old readings belong to the old address
+            self.errors.pop(old_ip, None)
+            copier["ip"] = ip
+            self._insert_row(copier, index)
+        self._save()
+        self._update_row(ip)
+        self._refresh_one(copier)
+        self._resort_copiers()
+        self.refresh_inventory()
+        return None
+
+    # ---- column sorting (shared by both tables) ----
+    def _make_sortable(self, tree, name, columns):
+        for key, title, _width in columns:
+            tree.heading(key, text=title,
+                         command=lambda k=key: self._sort_by(tree, name, columns, k))
+
+    def _sort_by(self, tree, name, columns, col):
+        cur = self.sorts.get(name)
+        descending = bool(cur and cur[0] == col and not cur[1])   # 2nd click flips
+        self.sorts[name] = (col, descending)
+        self._apply_sort(tree, name, columns)
+
+    def _apply_sort(self, tree, name, columns):
+        state = self.sorts.get(name)
+        for key, title, _width in columns:
+            arrow = ""
+            if state and state[0] == key:
+                arrow = "  \u25bc" if state[1] else "  \u25b2"
+            tree.heading(key, text=title + arrow)
+        if not state:
+            return
+        col, descending = state
+        keyed, blanks = [], []
+        for iid in tree.get_children(""):
+            k = sort_key(col, tree.set(iid, col))
+            (blanks if k is None else keyed).append((k, iid))
+        keyed.sort(key=lambda t: t[0], reverse=descending)
+        for pos, (_k, iid) in enumerate(keyed + blanks):    # blanks always last
+            tree.move(iid, "", pos)
+
+    def _resort_copiers(self):
+        self._apply_sort(self.tree, "copier", self.COLUMNS)
 
     def refresh_all(self):
         for c in self.copiers:
@@ -555,6 +693,7 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         if changed:
+            self._resort_copiers()
             self.refresh_inventory()
         self.after(100, self._poll_queue)
 
@@ -569,8 +708,8 @@ class App(tk.Tk):
         self.refresh_all()
         self._auto_job = self.after(AUTO_REFRESH_MS, self._auto_tick)
 
-    def _insert_row(self, copier):
-        self.tree.insert("", "end", iid=copier["ip"],
+    def _insert_row(self, copier, index="end"):
+        self.tree.insert("", index, iid=copier["ip"],
                          values=(copier["name"], copier["ip"], "", "", "", "", "", "", "", "Waiting..."))
         self._update_row(copier["ip"], waiting=True)
 
@@ -636,21 +775,26 @@ class App(tk.Tk):
         self.part_combo = ttk.Combobox(form, textvariable=self.part_var, width=22)
         self.part_combo.grid(row=1, column=0, padx=(0, 8))
         ttk.Label(form, text="Quantity").grid(row=0, column=1, sticky="w")
-        ttk.Spinbox(form, from_=1, to=999, textvariable=self.qty_var, width=6).grid(row=1, column=1, padx=(0, 8))
+        ttk.Spinbox(form, from_=0, to=999, textvariable=self.qty_var, width=6).grid(row=1, column=1, padx=(0, 8))
         ttk.Button(form, text="+ Add to stock", command=lambda: self.adjust_stock(+1)).grid(row=1, column=2, padx=2)
         ttk.Button(form, text="\u2212 Remove from stock", command=lambda: self.adjust_stock(-1)).grid(row=1, column=3, padx=2)
+        ttk.Button(form, text="Set exact count", command=self.set_exact).grid(row=1, column=4, padx=2)
         ttk.Label(form, text="Minimum to keep").grid(row=0, column=5, sticky="w", padx=(16, 0))
         ttk.Spinbox(form, from_=0, to=999, textvariable=self.min_var, width=6).grid(row=1, column=5, padx=(16, 8))
         ttk.Button(form, text="Set minimum", command=self.set_minimum).grid(row=1, column=6, padx=2)
-        ttk.Button(form, text="Delete part", command=self.delete_part).grid(row=1, column=7, padx=(16, 0))
+        mg = ttk.Frame(form)
+        mg.grid(row=2, column=0, columnspan=8, sticky="w", pady=(8, 0))
+        ttk.Button(mg, text="Rename part...", command=self.rename_part).pack(side="left")
+        ttk.Button(mg, text="Delete part", command=self.delete_part).pack(side="left", padx=6)
+        ttk.Label(mg, text="Click a column header to sort.", foreground="#666666").pack(side="left", padx=10)
 
         frame = ttk.Frame(tab)
         frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.inv_tree = ttk.Treeview(frame, columns=[c[0] for c in self.INV_COLUMNS],
                                      show="headings", selectmode="browse")
         for key, title, width in self.INV_COLUMNS:
-            self.inv_tree.heading(key, text=title)
             self.inv_tree.column(key, width=width, anchor="w" if key in ("part", "type", "status") else "center")
+        self._make_sortable(self.inv_tree, "inv", self.INV_COLUMNS)
         sb = ttk.Scrollbar(frame, orient="vertical", command=self.inv_tree.yview)
         self.inv_tree.configure(yscrollcommand=sb.set)
         self.inv_tree.pack(side="left", fill="both", expand=True)
@@ -677,6 +821,7 @@ class App(tk.Tk):
             self.inv_tree.insert("", "end", iid=r["part"], tags=(r["tag"],) if r["tag"] else (),
                                  values=(r["part"], r["type"], r["machines"], r["low"],
                                          r["on_hand"], r["net"], r["minimum"], r["status"]))
+        self._apply_sort(self.inv_tree, "inv", self.INV_COLUMNS)
         if selected and self.inv_tree.exists(selected[0]):
             self.inv_tree.selection_set(selected[0])
         self.part_combo["values"] = [r["part"] for r in rows]
@@ -727,6 +872,54 @@ class App(tk.Tk):
         self._save()
         self.refresh_inventory()
         self.status.set(f"{part}: {'added' if sign > 0 else 'removed'} {qty}, now {self.stock[part]} on hand")
+
+    def set_exact(self):
+        part = norm_part(self.part_var.get())
+        if not part:
+            messagebox.showerror("Part number", "Enter or select a part number.")
+            return
+        try:
+            qty = int(self.qty_var.get())
+            if qty < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Quantity", "Quantity must be a whole number, 0 or more.")
+            return
+        self.stock[part] = qty
+        self._save()
+        self.refresh_inventory()
+        self.status.set(f"{part}: on hand set to {qty}")
+
+    def rename_part(self):
+        """Rename a part everywhere: stock, minimum, and every copier assignment."""
+        old = norm_part(self.part_var.get())
+        known = {r["part"] for r in self.current_inventory_rows()}
+        if old not in known:
+            messagebox.showinfo("Rename part", "Select a part in the table first.")
+            return
+        new = norm_part(simpledialog.askstring("Rename part", f"New part number for {old}:",
+                                               initialvalue=old, parent=self))
+        if not new or new == old:
+            return
+        if new in known and not messagebox.askyesno(
+                "Merge parts", f"{new} already exists.\n\nMerge {old} into it? Stock counts are "
+                f"added together and copiers using {old} will switch to {new}."):
+            return
+        self.stock[new] = self.stock.get(new, 0) + self.stock.pop(old, 0)
+        if old in self.minimums:
+            self.minimums.setdefault(new, self.minimums.pop(old))
+            self.minimums.pop(old, None)
+        for c in self.copiers:
+            parts = c.get("parts") or {}
+            for slot, value in list(parts.items()):
+                if norm_part(value) == old:
+                    parts[slot] = new
+        self._save()
+        self.part_var.set(new)
+        self.refresh_inventory()
+        if self.inv_tree.exists(new):
+            self.inv_tree.selection_set(new)
+        self.status.set(f"Renamed {old} to {new} everywhere")
 
     def set_minimum(self):
         part = norm_part(self.part_var.get())
