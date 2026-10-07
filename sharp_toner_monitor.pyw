@@ -31,8 +31,8 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_FILE = Path.home() / ".sharp_toner_monitor.json"
 LOW_THRESHOLD = 10          # toner counts as low at/below this % remaining
-WASTE_FULL_THRESHOLD = 90   # waste collector counts as full at/above this % full
-DEFAULT_MIN_STOCK = 0       # minimum spares to keep for any part without its own
+WASTE_FULL_THRESHOLD = 190   # waste collector counts as full at/above this % full
+DEFAULT_MIN_STOCK = 1       # minimum spares to keep for any part without its own
                             # minimum (set per part on the Inventory tab)
 AUTO_REFRESH_MS = 5 * 60 * 1000
 SNMP_TIMEOUT = 2.0
