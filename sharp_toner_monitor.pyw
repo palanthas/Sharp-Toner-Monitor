@@ -32,7 +32,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_FILE = Path.home() / ".sharp_toner_monitor.json"
 LOW_THRESHOLD = 10          # toner counts as low at/below this % remaining
-WASTE_FULL_THRESHOLD = 101   # waste collector counts as full at/above this % full
+WASTE_FULL_THRESHOLD = 101  # waste collector counts as full at/above this % full
 DEFAULT_MIN_STOCK = 0       # minimum spares to keep for any part without its own
                             # minimum (set per part on the Inventory tab)
 AUTO_REFRESH_MS = 5 * 60 * 1000
@@ -438,13 +438,21 @@ def inventory_rows(copiers, results, stock, minimums=None):
     """
     minimums = minimums or {}
     machines, low, types, low_by = Counter(), Counter(), {}, {}
+    models, unknown, seen = {}, {}, {}      # per part: model counts / copiers w/o a known model
     for c in copiers:
         res = results.get(c["ip"])
+        model = (res.get("model") if res else "") or c.get("model", "")
         for slot, header in SLOTS:
             part = norm_part((c.get("parts") or {}).get(slot))
             if not part:
                 continue
             machines[part] += 1
+            if c["ip"] not in seen.setdefault(part, set()):     # count each copier once per part
+                seen[part].add(c["ip"])
+                if model:
+                    models.setdefault(part, Counter())[model_key(model)] += 1
+                else:
+                    unknown.setdefault(part, []).append(c["name"])
             label = slot_type_label(slot, header)
             if label not in types.setdefault(part, []):
                 types[part].append(label)
@@ -471,8 +479,30 @@ def inventory_rows(copiers, results, stock, minimums=None):
         rows.append({"part": part, "type": ", ".join(types.get(part, [])) or "(unassigned)",
                      "machines": machines[part], "low": need, "on_hand": on_hand,
                      "net": net, "minimum": minimum, "status": status, "tag": tag,
-                     "low_machines": low_by.get(part, [])})
+                     "low_machines": low_by.get(part, []),
+                     "models": sorted(models.get(part, {}).items(), key=lambda kv: _natural(kv[0])),
+                     "unknown": unknown.get(part, [])})
     return rows
+
+
+def describe_part(row):
+    """Text for the inventory detail popup: low machines, then models using the part."""
+    lines = []
+    if row["low_machines"]:
+        lines.append(f"Low now ({len(row['low_machines'])}):")
+        lines += [f"  {name}" for name in row["low_machines"]]
+    else:
+        lines.append("No machines are currently low on this part.")
+    lines.append("")
+    if row["models"] or row["unknown"]:
+        lines.append("Models using this part:")
+        for key, n in row["models"]:
+            lines.append(f"  {key} ({n} machine{'s' if n != 1 else ''})")
+        if row["unknown"]:
+            lines.append(f"  Unknown model: {', '.join(row['unknown'])}")
+    else:
+        lines.append("No copiers are assigned this part.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -1202,9 +1232,9 @@ class App(tk.Tk):
         rows = self.current_inventory_rows()
         selected = self.inv_tree.selection()
         self.inv_tree.delete(*self.inv_tree.get_children())
-        self._inv_low_machines = {}
+        self._inv_rows = {}
         for r in rows:
-            self._inv_low_machines[r["part"]] = r["low_machines"]
+            self._inv_rows[r["part"]] = r
             self.inv_tree.insert("", "end", iid=r["part"], tags=(r["tag"],) if r["tag"] else (),
                                  values=(r["part"], r["type"], r["machines"], r["low"],
                                          r["on_hand"], r["net"], r["minimum"], r["status"]))
@@ -1235,9 +1265,9 @@ class App(tk.Tk):
         sel = self.inv_tree.selection()
         if not sel:
             return
-        machines = self._inv_low_machines.get(sel[0], [])
-        body = "\n".join(machines) if machines else "No machines are currently low on this part."
-        messagebox.showinfo(f"{sel[0]} - machines needing it", body)
+        row = self._inv_rows.get(sel[0])
+        if row:
+            messagebox.showinfo(f"{sel[0]} - details", describe_part(row))
 
     def adjust_stock(self, sign):
         part = norm_part(self.part_var.get())
