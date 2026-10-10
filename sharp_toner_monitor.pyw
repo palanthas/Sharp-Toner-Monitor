@@ -22,6 +22,7 @@ import queue
 import random
 import re
 import socket
+import threading
 import time
 import tkinter as tk
 from collections import Counter
@@ -31,12 +32,15 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_FILE = Path.home() / ".sharp_toner_monitor.json"
 LOW_THRESHOLD = 10          # toner counts as low at/below this % remaining
-WASTE_FULL_THRESHOLD = 190   # waste collector counts as full at/above this % full
-DEFAULT_MIN_STOCK = 1       # minimum spares to keep for any part without its own
+WASTE_FULL_THRESHOLD = 101   # waste collector counts as full at/above this % full
+DEFAULT_MIN_STOCK = 0       # minimum spares to keep for any part without its own
                             # minimum (set per part on the Inventory tab)
 AUTO_REFRESH_MS = 5 * 60 * 1000
 SNMP_TIMEOUT = 2.0
 SNMP_RETRIES = 1
+SCAN_TIMEOUT = 1.0          # seconds to wait for each host during a scan
+SCAN_WORKERS = 64           # hosts probed in parallel
+MAX_SCAN_HOSTS = 1024       # refuse ranges bigger than this (e.g. a whole /16)
 
 # Slots a copier can have a part number for: (key, column header)
 SLOTS = (("K", "Black"), ("C", "Cyan"), ("M", "Magenta"), ("Y", "Yellow"),
@@ -77,6 +81,49 @@ def sort_key(col, text):
         if m:
             return (0, float(m.group(1)))
     return (1, _natural(text))
+
+
+# Model matching, used to put like machines first when copying parts.
+MODEL_RE = re.compile(r"\b[A-Za-z]{1,4}-[A-Za-z]*\d+[A-Za-z0-9]*\b")   # e.g. MX-3071, BP-70C45
+SIMILAR_MIN_PREFIX = 5      # models sharing this many leading characters are "similar"
+SAME_MODEL = 10_000
+
+
+def model_key(text):
+    """Reduce a description like 'SHARP BP-70C45 ver 1.2' to 'BP-70C45'."""
+    text = " ".join((text or "").split())
+    m = MODEL_RE.search(text)
+    return (m.group(0) if m else text).upper()
+
+
+def model_similarity(a, b):
+    """0 = unknown/unrelated, higher = more alike, SAME_MODEL = identical model."""
+    ka, kb = model_key(a), model_key(b)
+    if not ka or not kb:
+        return 0
+    if ka == kb:
+        return SAME_MODEL
+    n = 0
+    for x, y in zip(ka, kb):
+        if x != y:
+            break
+        n += 1
+    return n if n >= SIMILAR_MIN_PREFIX else 0
+
+
+def order_copy_sources(target_model, candidates):
+    """
+    candidates: [(name, model, item)]. Returns [(item, tag)] with the closest
+    models first (tag is 'same model' / 'similar model'), then everything else
+    alphabetically by name.
+    """
+    scored = [(model_similarity(target_model, model), name, item) for name, model, item in candidates]
+    scored.sort(key=lambda t: (-t[0], _natural(t[1])))
+    out = []
+    for score, _name, item in scored:
+        tag = "same model" if score >= SAME_MODEL else "similar model" if score else ""
+        out.append((item, tag))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -152,7 +199,7 @@ def _dec_value(tag, c):
     return c
 
 
-def snmp_get_next(sock, ip, community, oid):
+def snmp_get_next(sock, ip, community, oid, retries=SNMP_RETRIES):
     """Send one GETNEXT and return (next_oid, value)."""
     req_id = random.randint(1, 0x7FFFFFFF)
     varbind = _tlv(0x30, _enc_oid(oid) + b"\x05\x00")
@@ -160,7 +207,7 @@ def snmp_get_next(sock, ip, community, oid):
     msg = _tlv(0x30, _enc_int(1) + _tlv(0x04, community.encode()) + pdu)
 
     last_err = socket.timeout("no response (check IP, SNMP enabled, community string)")
-    for _ in range(SNMP_RETRIES + 1):
+    for _ in range(retries + 1):
         sock.sendto(msg, (ip, 161))
         try:
             while True:
@@ -286,6 +333,99 @@ def fetch_copier(ip, community):
 
 
 # --------------------------------------------------------------------------
+# Network scanning
+# --------------------------------------------------------------------------
+
+def parse_ip_range(text):
+    """
+    Turn user input into a list of IPv4 address strings. Accepts, comma-separated:
+      192.168.0.50            a single address
+      192.168.0.50-60         last-octet range
+      192.168.0.50-192.168.1.9  full range
+      192.168.0.0/24          CIDR network (network/broadcast addresses skipped)
+    Raises ValueError with a readable message on bad input or oversized ranges.
+    """
+    def v4(t):
+        try:
+            ip = ipaddress.ip_address(t.strip())
+        except ValueError:
+            raise ValueError(f"'{t.strip()}' is not a valid IP address.")
+        if ip.version != 4:
+            raise ValueError("Only IPv4 addresses are supported.")
+        return ip
+
+    hosts = []
+    parts = [p.strip() for p in re.split(r"[,;]", text) if p.strip()]
+    if not parts:
+        raise ValueError("Enter an IP range to scan.")
+    for part in parts:
+        if "/" in part:
+            try:
+                net = ipaddress.ip_network(part, strict=False)
+            except ValueError:
+                raise ValueError(f"'{part}' is not a valid network.")
+            if net.version != 4:
+                raise ValueError("Only IPv4 addresses are supported.")
+            hosts.extend(str(h) for h in net.hosts())
+        elif "-" in part:
+            left, right = (t.strip() for t in part.split("-", 1))
+            start = v4(left)
+            end = v4(right if "." in right else left.rsplit(".", 1)[0] + "." + right)
+            if int(end) < int(start):
+                raise ValueError(f"Range '{part}' ends before it starts.")
+            if int(end) - int(start) + 1 > MAX_SCAN_HOSTS:
+                raise ValueError(f"Range '{part}' is too large (limit {MAX_SCAN_HOSTS} addresses).")
+            hosts.extend(str(ipaddress.ip_address(i)) for i in range(int(start), int(end) + 1))
+        else:
+            hosts.append(str(v4(part)))
+        if len(hosts) > MAX_SCAN_HOSTS:
+            raise ValueError(f"That's more than {MAX_SCAN_HOSTS} addresses. Narrow the range.")
+    return list(dict.fromkeys(hosts))     # de-duplicate, keep order
+
+
+def probe_host(ip, community):
+    """
+    Ask one address for its SNMP identity. Returns a dict, or None if it doesn't
+    answer. 'printer' is True when the Printer-MIB supplies table exists.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(SCAN_TIMEOUT)
+    try:
+        try:
+            _, descr = snmp_get_next(sock, ip, community, "1.3.6.1.2.1.1.1", retries=1)
+        except (socket.timeout, OSError):
+            return None
+        if descr is END or not isinstance(descr, str):
+            return None
+        name, printer = "", False
+        try:
+            oid, val = snmp_get_next(sock, ip, community, "1.3.6.1.2.1.1.4.0", retries=1)
+            if oid == "1.3.6.1.2.1.1.5.0" and isinstance(val, str):
+                name = val
+            oid, val = snmp_get_next(sock, ip, community, f"{SUPPLIES}.{COL_DESC}", retries=1)
+            printer = val is not END and oid.startswith(f"{SUPPLIES}.{COL_DESC}.")
+        except (socket.timeout, OSError):
+            pass
+        descr = " ".join(descr.split())
+        return {"ip": ip, "name": name.strip(), "descr": descr, "printer": printer,
+                "sharp": "sharp" in (descr + " " + name).lower()}
+    finally:
+        sock.close()
+
+
+def guess_scan_range():
+    """Pre-fill the scan box with this computer's /24."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))         # no packet is sent; just picks a route
+        local = s.getsockname()[0]
+        s.close()
+        return local.rsplit(".", 1)[0] + ".1-254"
+    except OSError:
+        return "192.168.0.1-254"
+
+
+# --------------------------------------------------------------------------
 # Inventory logic (pure functions, no GUI)
 # --------------------------------------------------------------------------
 
@@ -358,10 +498,15 @@ class PartsDialog(tk.Toplevel):
         if others:
             ttk.Label(body, text="Copy from").grid(row=row, column=0, sticky="w", pady=(0, 8))
             self.copy_var = tk.StringVar()
-            cb = ttk.Combobox(body, textvariable=self.copy_var, state="readonly", width=26,
-                              values=[f"{c['name']} ({c['ip']})" for c in others])
+            ordered = order_copy_sources(
+                app.model_of(copier), [(c["name"], app.model_of(c), c) for c in others])
+            self.copy_map = {}
+            for c, tag in ordered:      # closest model first, then alphabetical
+                self.copy_map[f"{c['name']} ({c['ip']})" + (f" - {tag}" if tag else "")] = c
+            cb = ttk.Combobox(body, textvariable=self.copy_var, state="readonly", width=40,
+                              values=list(self.copy_map))
             cb.grid(row=row, column=1, pady=(0, 8))
-            cb.bind("<<ComboboxSelected>>", lambda e: self._copy_from(others))
+            cb.bind("<<ComboboxSelected>>", lambda e: self._copy_from())
             row += 1
 
         self.vars = {}
@@ -382,12 +527,11 @@ class PartsDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self.destroy())
         self.grab_set()
 
-    def _copy_from(self, others):
-        i = self.copy_var.get()
-        for c in others:
-            if f"{c['name']} ({c['ip']})" == i:
-                for slot, _ in SLOTS:
-                    self.vars[slot].set((c.get("parts") or {}).get(slot, ""))
+    def _copy_from(self):
+        c = self.copy_map.get(self.copy_var.get())
+        if c:
+            for slot, _ in SLOTS:
+                self.vars[slot].set((c.get("parts") or {}).get(slot, ""))
 
     def _save(self):
         self.copier["parts"] = {slot: norm_part(v.get()) for slot, v in self.vars.items()}
@@ -430,6 +574,207 @@ class CopierDialog(tk.Toplevel):
         if err:
             messagebox.showerror("Edit copier", err, parent=self)
             return
+        self.destroy()
+
+
+class ScanDialog(tk.Toplevel):
+    """Scan an IP range over SNMP and add the copiers it finds."""
+
+    COLUMNS = (("ip", "IP Address", 120), ("name", "Name", 150),
+               ("type", "Type", 130), ("descr", "Description", 380))
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.title("Scan for copiers")
+        self.geometry("880x540")
+        self.minsize(720, 420)
+        self.transient(app)
+        self.app = app
+        self.found = {}                 # ip -> probe result
+        self.running = False
+        self.cancel = threading.Event()
+        self.scan_q = queue.Queue()
+        self.pool = None
+        self.total = self.done = self.skipped = 0
+        self.scanned_community = "public"
+
+        box = ttk.LabelFrame(self, text="What to scan", padding=8)
+        box.pack(fill="x", padx=10, pady=(10, 4))
+        self.range_var = tk.StringVar(value=guess_scan_range())
+        self.comm_var = tk.StringVar(value="public")
+        ttk.Label(box, text="IP range").grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(box, textvariable=self.range_var, width=46)
+        entry.grid(row=1, column=0, padx=(0, 8))
+        ttk.Label(box, text="SNMP community").grid(row=0, column=1, sticky="w")
+        ttk.Entry(box, textvariable=self.comm_var, width=16).grid(row=1, column=1, padx=(0, 8))
+        self.scan_btn = ttk.Button(box, text="Scan", command=self.start_scan)
+        self.scan_btn.grid(row=1, column=2, padx=2)
+        self.stop_btn = ttk.Button(box, text="Stop", command=self.stop_scan, state="disabled")
+        self.stop_btn.grid(row=1, column=3, padx=2)
+        ttk.Label(box, foreground="#666666",
+                  text="Examples: 192.168.0.50-60   192.168.0.0/24   10.0.0.5-10.0.1.20   "
+                       "(separate several with commas). Addresses already in your list are skipped."
+                  ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.printers_only = tk.BooleanVar(value=True)
+        self.sharp_only = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Only show printers/copiers", variable=self.printers_only,
+                        command=self._render).grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(box, text="Only show Sharp", variable=self.sharp_only,
+                        command=self._render).grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 0))
+
+        prog = ttk.Frame(self)
+        prog.pack(fill="x", padx=10, pady=4)
+        self.bar = ttk.Progressbar(prog, mode="determinate")
+        self.bar.pack(side="left", fill="x", expand=True)
+        self.info = tk.StringVar(value="Enter a range and click Scan.")
+        ttk.Label(prog, textvariable=self.info, width=48).pack(side="left", padx=(8, 0))
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        self.tree = ttk.Treeview(frame, columns=[c[0] for c in self.COLUMNS],
+                                 show="headings", selectmode="extended")
+        for key, title, width in self.COLUMNS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, anchor="w")
+        sb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<Control-a>", lambda e: (self.select_all(), "break")[1])
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=10, pady=(4, 10))
+        ttk.Button(btns, text="Close", command=self._close).pack(side="right")
+        ttk.Button(btns, text="Add selected to monitor", command=self.add_selected).pack(side="right", padx=6)
+        ttk.Button(btns, text="Select all", command=self.select_all).pack(side="left")
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+        entry.focus_set()
+        entry.bind("<Return>", lambda e: self.start_scan())
+
+    # ---- scanning ----
+    def start_scan(self):
+        if self.running:
+            return
+        try:
+            hosts = parse_ip_range(self.range_var.get())
+        except ValueError as e:
+            messagebox.showerror("IP range", str(e), parent=self)
+            return
+        existing = {c["ip"] for c in self.app.copiers}
+        todo = [h for h in hosts if h not in existing]
+        self.skipped = len(hosts) - len(todo)
+        if not todo:
+            self.info.set(f"Nothing to scan: all {self.skipped} address(es) are already added.")
+            return
+        self.scanned_community = self.comm_var.get().strip() or "public"
+        self.found.clear()
+        self._render()
+        self.cancel = threading.Event()
+        self.scan_q = queue.Queue()
+        self.total, self.done = len(todo), 0
+        self.bar.configure(maximum=self.total, value=0)
+        self.running = True
+        self.scan_btn.state(["disabled"])
+        self.stop_btn.state(["!disabled"])
+        self.pool = ThreadPoolExecutor(max_workers=SCAN_WORKERS)
+        for ip in todo:
+            self.pool.submit(self._probe, ip, self.scanned_community, self.cancel, self.scan_q)
+        self._update_info()
+        self.after(100, self._poll)
+
+    @staticmethod
+    def _probe(ip, community, cancel, out):
+        result = None
+        if not cancel.is_set():
+            try:
+                result = probe_host(ip, community)
+            except Exception:
+                result = None
+        out.put((ip, result))
+
+    def stop_scan(self):
+        self.cancel.set()
+        self.stop_btn.state(["disabled"])
+        self.info.set("Stopping...")
+
+    def _poll(self):
+        if not self.running:
+            return
+        got = False
+        try:
+            while True:
+                ip, res = self.scan_q.get_nowait()
+                self.done += 1
+                if res:
+                    self.found[ip] = res
+                    got = True
+        except queue.Empty:
+            pass
+        self.bar["value"] = self.done
+        if got:
+            self._render()
+        if self.done >= self.total:
+            self._finish()
+        else:
+            self._update_info()
+            self.after(100, self._poll)
+
+    def _finish(self):
+        self.running = False
+        if self.pool:
+            self.pool.shutdown(wait=False)
+        self.scan_btn.state(["!disabled"])
+        self.stop_btn.state(["disabled"])
+        verb = "Stopped" if self.cancel.is_set() else "Done"
+        self.info.set(f"{verb}. Scanned {self.done}/{self.total}, found {len(self._visible())}"
+                      + (f" ({self.skipped} already added, skipped)" if self.skipped else ""))
+
+    def _update_info(self):
+        self.info.set(f"Scanned {self.done}/{self.total}, found {len(self._visible())}"
+                      + (f" ({self.skipped} already added, skipped)" if self.skipped else ""))
+
+    # ---- results ----
+    def _visible(self):
+        rows = [r for r in self.found.values()
+                if (r["printer"] or not self.printers_only.get())
+                and (r["sharp"] or not self.sharp_only.get())]
+        rows.sort(key=lambda r: int(ipaddress.ip_address(r["ip"])))
+        return rows
+
+    def _render(self):
+        selected = set(self.tree.selection())
+        self.tree.delete(*self.tree.get_children())
+        for r in self._visible():
+            kind = ("Sharp printer" if r["sharp"] else "Printer") if r["printer"] else "Other SNMP device"
+            self.tree.insert("", "end", iid=r["ip"],
+                             values=(r["ip"], r["name"], kind, r["descr"][:80]))
+        keep = [i for i in selected if self.tree.exists(i)]
+        if keep:
+            self.tree.selection_set(keep)
+        if not self.running and self.total:
+            self._update_info()
+
+    def select_all(self):
+        self.tree.selection_set(self.tree.get_children())
+
+    def add_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            self.info.set("Select one or more devices first.")
+            return
+        chosen = [self.found[ip] for ip in sel if ip in self.found]
+        added = self.app.add_scanned(chosen, self.scanned_community)
+        for ip in sel:
+            self.found.pop(ip, None)
+        self._render()
+        self.info.set(f"Added {added} copier(s). Assign their parts on the Copiers tab.")
+
+    def _close(self):
+        self.cancel.set()
+        self.running = False
+        if self.pool:
+            self.pool.shutdown(wait=False)
         self.destroy()
 
 
@@ -514,6 +859,7 @@ class App(tk.Tk):
         ttk.Label(add, text="SNMP community").grid(row=0, column=2, sticky="w")
         ttk.Entry(add, textvariable=self.comm_var, width=16).grid(row=1, column=2, padx=(0, 8))
         ttk.Button(add, text="Add", command=self.add_copier).grid(row=1, column=3)
+        ttk.Button(add, text="Scan network...", command=self.open_scan).grid(row=1, column=4, padx=(24, 0))
         ip_entry.bind("<Return>", lambda e: self.add_copier())
         ip_entry.focus_set()
 
@@ -592,6 +938,39 @@ class App(tk.Tk):
 
         PartsDialog(self, copier, saved)
 
+    def model_of(self, copier):
+        """Best-known model description: latest reading, else the remembered one."""
+        res = self.results.get(copier["ip"])
+        return (res.get("model") if res else "") or copier.get("model", "")
+
+    def open_scan(self):
+        dlg = getattr(self, "_scan_dialog", None)
+        if dlg is not None and dlg.winfo_exists():
+            dlg.lift()
+            return
+        self._scan_dialog = ScanDialog(self)
+
+    def add_scanned(self, found, community):
+        """Add copiers discovered by a scan. Returns how many were new."""
+        existing = {c["ip"] for c in self.copiers}
+        added = 0
+        for f in found:
+            if f["ip"] in existing:
+                continue
+            copier = {"ip": f["ip"], "name": f["name"] or f["ip"],
+                      "community": community, "parts": {}, "model": f.get("descr", "")}
+            self.copiers.append(copier)
+            existing.add(f["ip"])
+            self._insert_row(copier)
+            self._refresh_one(copier)
+            added += 1
+        if added:
+            self._save()
+            self._resort_copiers()
+            self.refresh_inventory()
+            self.status.set(f"Added {added} scanned copier(s). Use 'Assign parts...' on each.")
+        return added
+
     def edit_copier(self):
         sel = self.tree.selection()
         if not sel:
@@ -618,6 +997,7 @@ class App(tk.Tk):
             self.results.pop(old_ip, None)          # old readings belong to the old address
             self.errors.pop(old_ip, None)
             copier["ip"] = ip
+            copier.pop("model", None)               # new address, maybe a different machine
             self._insert_row(copier, index)
         self._save()
         self._update_row(ip)
@@ -675,7 +1055,7 @@ class App(tk.Tk):
         self.q.put((ip, res))
 
     def _poll_queue(self):
-        changed = False
+        changed = model_changed = False
         try:
             while True:
                 ip, res = self.q.get_nowait()
@@ -687,11 +1067,18 @@ class App(tk.Tk):
                 else:
                     self.results[ip] = res
                     self.errors.pop(ip, None)
+                    model = " ".join(res["model"].split())
+                    c = next((c for c in self.copiers if c["ip"] == ip), None)
+                    if c and model and c.get("model") != model:
+                        c["model"] = model          # remembered for model matching
+                        model_changed = True
                     self.status.set(f"Updated {ip} at {res['time']}")
                 self._update_row(ip)
                 changed = True
         except queue.Empty:
             pass
+        if model_changed:
+            self._save()
         if changed:
             self._resort_copiers()
             self.refresh_inventory()
