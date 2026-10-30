@@ -32,7 +32,10 @@ from tkinter import messagebox, simpledialog, ttk
 
 CONFIG_FILE = Path.home() / ".sharp_toner_monitor.json"
 LOW_THRESHOLD = 10          # toner counts as low at/below this % remaining
-WASTE_FULL_THRESHOLD = 101  # waste collector counts as full at/above this % full
+# Sharp copiers don't measure waste toner, they only know full / not full. Observed:
+# a container that isn't full reads 100, and a full one reads -3 (shown as "OK" before).
+# Any raw level listed here is treated as a FULL waste container.
+WASTE_FULL_LEVELS = (-3,)
 DEFAULT_MIN_STOCK = 0       # minimum spares to keep for any part without its own
                             # minimum (set per part on the Inventory tab)
 AUTO_REFRESH_MS = 5 * 60 * 1000
@@ -251,8 +254,6 @@ def snmp_walk(sock, ip, community, base):
 SUPPLIES = "1.3.6.1.2.1.43.11.1.1"
 COL_CLASS, COL_TYPE, COL_DESC, COL_MAX, COL_LEVEL = 4, 5, 6, 8, 9
 SUPPLY_TYPE_TONER, SUPPLY_TYPE_WASTE = 3, 4
-SUPPLY_CLASS_CONSUMED = 3       # level = amount remaining
-SUPPLY_CLASS_RECEPTACLE = 4     # level = amount filled (e.g. waste toner box)
 
 COLOR_PATTERNS = [
     ("K", re.compile(r"black|\bbk\b|\bk\b", re.I)),
@@ -275,6 +276,23 @@ def level_to_pct(level, maximum):
     return pct, f"{pct}%"
 
 
+def waste_state(level, maximum):
+    """
+    Interpret a waste toner container reading as space REMAINING, the way these
+    Sharps report it. Returns (remaining pct or None, display text, is_full).
+    """
+    if level in WASTE_FULL_LEVELS:
+        return None, "FULL", True
+    pct, _ = level_to_pct(level, maximum)
+    if pct is None:
+        return None, "?", False
+    if pct >= 100:
+        return pct, "OK", False
+    if pct == 0:
+        return pct, "FULL", True
+    return pct, f"{pct}% left", pct <= LOW_THRESHOLD
+
+
 def fetch_copier(ip, community):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(SNMP_TIMEOUT)
@@ -293,15 +311,15 @@ def fetch_copier(ip, community):
             return cols[col].get(f"{SUPPLIES}.{col}.{idx[0]}.{idx[1]}")
 
         stype, klass = get(COL_TYPE), get(COL_CLASS)
-        pct, text = level_to_pct(get(COL_LEVEL), get(COL_MAX))
+        level, maximum = get(COL_LEVEL), get(COL_MAX)
+        pct, text = level_to_pct(level, maximum)
         is_waste = stype == SUPPLY_TYPE_WASTE or "waste" in desc.lower()
         is_toner = stype == SUPPLY_TYPE_TONER or "toner" in desc.lower()
 
-        # Waste collectors normally report how FULL they are (class 4).
-        fills = is_waste and klass != SUPPLY_CLASS_CONSUMED
-        if fills and pct is not None:
-            text = f"{pct}% full"
-        low = pct is not None and (pct >= WASTE_FULL_THRESHOLD if fills else pct <= LOW_THRESHOLD)
+        if is_waste:
+            pct, text, low = waste_state(level, maximum)
+        else:
+            low = pct is not None and pct <= LOW_THRESHOLD
 
         slot = None
         if is_waste:
@@ -312,7 +330,8 @@ def fetch_copier(ip, community):
                     slot = code
                     break
         supplies.append({"desc": desc, "pct": pct, "text": text, "low": low,
-                         "waste": is_waste, "toner": is_toner, "fills": fills,
+                         "waste": is_waste, "toner": is_toner,
+                         "raw": f"level={level}, max={maximum}, class={klass}",
                          "slot": slot})
 
     # Mono machines often name their single toner something unrecognisable
@@ -1169,9 +1188,8 @@ class App(tk.Tk):
             return
         lines = []
         for s in res["supplies"]:
-            note = " (fills up)" if s["fills"] else ""
             flag = "  <-- LOW" if s["low"] and s["slot"] else ""
-            lines.append(f"{s['desc']}: {s['text']}{note}{flag}")
+            lines.append(f"{s['desc']}: {s['text']}{flag}\n      raw: {s['raw']}")
         messagebox.showinfo(f"{ip} - supplies", "\n".join(lines))
 
     # ======================================================================
